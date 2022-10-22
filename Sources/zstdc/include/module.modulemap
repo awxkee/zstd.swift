@@ -1,0 +1,4 @@
+module zstdc {
+    header "zstd.h"
+    export *
+}
