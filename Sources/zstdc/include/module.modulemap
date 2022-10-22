@@ -1,4 +1,4 @@
 module zstdc {
-    header "zstd.h"
+    header "../zstdc.h"
     export *
 }

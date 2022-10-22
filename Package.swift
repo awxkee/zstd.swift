@@ -23,7 +23,7 @@ let package = Package(
         .target(name: "zstdc", dependencies: ["libzstd"]),
         .binaryTarget(name: "libzstd", path: "Sources/libzstd/libzstd.xcframework"),
         .testTarget(
-            name: "zstd-swiftTests",
+            name: "zstd-Tests",
             dependencies: ["zstd"]),
     ]
 )
