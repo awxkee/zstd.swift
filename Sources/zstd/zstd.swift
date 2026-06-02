@@ -60,56 +60,69 @@ public struct ZStd {
         }
     }
 
-
     /**
      - Streams will be opened automatically
-     - Streams will be closed only on successfull compression
+     - Streams will be closed on completion or error
      */
     public static func decompress(src: InputStream, dst: OutputStream) throws {
+        guard let cctx = ZSTD_createDCtx() else {
+            throw ZStdOutOfMemoryError(requiredSize: 0)
+        }
+        defer { ZSTD_freeDCtx(cctx) }
 
-        let cctx = ZSTD_createDCtx()
-
-        let inBufSize = ZSTD_DStreamInSize()
+        let inBufSize  = ZSTD_DStreamInSize()
         let outBufSize = ZSTD_DStreamOutSize()
+
         guard let srcBuf = malloc(inBufSize) else {
             throw ZStdOutOfMemoryError(requiredSize: inBufSize)
         }
+        defer { free(srcBuf) }
+
         guard let dstBuf = malloc(outBufSize) else {
-            throw ZStdOutOfMemoryError(requiredSize: inBufSize)
+            throw ZStdOutOfMemoryError(requiredSize: outBufSize)
         }
-        let toRead = inBufSize
+        defer { free(dstBuf) }
+
         src.open()
         dst.open()
-        var readSize: Int = 1
+        defer {
+            src.close()
+            dst.close()
+        }
+
         var isEmpty = true
-        while readSize != 0 {
-            isEmpty = false
-            readSize = src.read(srcBuf, maxLength: toRead)
-            if readSize == -1 {
-                ZSTD_freeDCtx(cctx)
-                src.close()
-                dst.close()
+
+        while true {
+            let readSize = src.read(srcBuf, maxLength: inBufSize)
+
+            if readSize == 0 { break }   // EOF clean exit
+
+            if readSize < 0 {
                 throw ZStdReadingFromStreamSignalledError()
             }
-            
-            var input = ZSTD_inBuffer(src: srcBuf, size: readSize, pos: 0)
 
+            isEmpty = false
+
+            var input = ZSTD_inBuffer(src: srcBuf, size: readSize, pos: 0)
             while input.pos < input.size {
                 var output = ZSTD_outBuffer(dst: dstBuf, size: outBufSize, pos: 0)
                 let remaining = ZSTD_decompressStream(cctx, &output, &input)
+
                 if ZSTD_isError(remaining) != 0 {
-                    ZSTD_freeDCtx(cctx)
-                    src.close()
-                    dst.close()
-                    throw ZStdUnderlyingError(code: remaining,
-                                              error: String(utf8String: ZSTD_getErrorName(remaining)) ?? "")
+                    throw ZStdUnderlyingError(
+                        code: remaining,
+                        error: String(utf8String: ZSTD_getErrorName(remaining)) ?? "")
                 }
-                dst.write(dstBuf, maxLength: output.pos)
+
+                if output.pos > 0 {
+                    dst.write(dstBuf, maxLength: output.pos)
+                }
+
+                if remaining == 0 {
+                    ZSTD_DCtx_reset(cctx, ZSTD_reset_session_only)
+                }
             }
         }
-        ZSTD_freeDCtx(cctx)
-        src.close()
-        dst.close()
 
         if isEmpty {
             throw ZStdReadingFromStreamSignalledError()
@@ -118,7 +131,7 @@ public struct ZStd {
 
     /**
      - Streams will be opened automatically
-     - Streams will be closed only on successfull compression
+     - Streams will be closed on completion or error
      */
     public static func compress(src: InputStream, dst: OutputStream,
                                 compressionLevel: Int? = nil, threads: Int = 4) throws {
@@ -130,7 +143,11 @@ public struct ZStd {
             level = Int32(compressionLevel)
         }
 
-        let cctx = ZSTD_createCCtx()
+        guard let cctx = ZSTD_createCCtx() else {
+            throw ZStdOutOfMemoryError(requiredSize: 0)
+        }
+        defer { ZSTD_freeCCtx(cctx) }
+
         var ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level)
         try checkErrorCode(code: ret)
         ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1)
@@ -138,55 +155,59 @@ public struct ZStd {
         ret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, Int32(threads))
         try checkErrorCode(code: ret)
 
-        let inBufSize = ZSTD_CStreamInSize()
+        let inBufSize  = ZSTD_CStreamInSize()
         let outBufSize = ZSTD_CStreamOutSize()
+
         guard let srcBuf = malloc(inBufSize) else {
             throw ZStdOutOfMemoryError(requiredSize: inBufSize)
         }
+        defer { free(srcBuf) }
+
         guard let dstBuf = malloc(outBufSize) else {
-            throw ZStdOutOfMemoryError(requiredSize: inBufSize)
+            throw ZStdOutOfMemoryError(requiredSize: outBufSize)
         }
-        let toRead = inBufSize
-        var compressed = false
+        defer { free(dstBuf) }
+
         src.open()
         dst.open()
+        defer {
+            src.close()
+            dst.close()
+        }
+
+        var compressed = false
         while !compressed {
-            let readSize = src.read(srcBuf, maxLength: toRead)
-            if readSize == -1 {
-                ZSTD_freeCCtx(cctx)
-                src.close()
-                dst.close()
+            let readSize = src.read(srcBuf, maxLength: inBufSize)
+
+            if readSize < 0 {
                 throw ZStdReadingFromStreamSignalledError()
             }
-            let lastChunk = readSize < toRead
-            let directive = lastChunk ? ZSTD_e_end : ZSTD_e_continue
+
+            let lastChunk = readSize < inBufSize
+            let directive: ZSTD_EndDirective = lastChunk ? ZSTD_e_end : ZSTD_e_continue
 
             var input = ZSTD_inBuffer(src: srcBuf, size: readSize, pos: 0)
 
             var finished = false
-            while !finished {
+            repeat {
                 var output = ZSTD_outBuffer(dst: dstBuf, size: outBufSize, pos: 0)
                 let remaining = ZSTD_compressStream2(cctx, &output, &input, directive)
+
                 if ZSTD_isError(remaining) != 0 {
-                    ZSTD_freeCCtx(cctx)
-                    src.close()
-                    dst.close()
-                    throw ZStdUnderlyingError(code: remaining,
-                                              error: String(utf8String: ZSTD_getErrorName(remaining)) ?? "")
+                    throw ZStdUnderlyingError(
+                        code: remaining,
+                        error: String(utf8String: ZSTD_getErrorName(remaining)) ?? "")
                 }
-                dst.write(dstBuf, maxLength: output.pos)
+
+                if output.pos > 0 {
+                    dst.write(dstBuf, maxLength: output.pos)
+                }
+
                 finished = lastChunk ? (remaining == 0) : (input.pos == input.size)
-            }
+            } while !finished
 
-            if lastChunk {
-                compressed = true
-                break
-            }
+            if lastChunk { compressed = true }
         }
-
-        ZSTD_freeCCtx(cctx)
-        src.close()
-        dst.close()
     }
 
     public static func compress(_ data: Data, compressionLevel: Int? = nil) throws -> Data {
@@ -215,26 +236,13 @@ public struct ZStd {
     }
 
     public static func decompress(_ data: Data) throws -> Data {
-        try data.withUnsafeBytes { (rawPointer: UnsafeRawBufferPointer) in
-            let maxBound = ZSTD_getFrameContentSize(rawPointer.baseAddress, data.count)
-            if maxBound == ZSTD_CONTENTSIZE_ERROR || maxBound == ZSTD_CONTENTSIZE_UNKNOWN {
-                throw ZStdRecognitionError()
-            }
-            guard maxBound > 0 else {
-                throw ZStdOutOfMemoryError(requiredSize: Int(maxBound))
-            }
-            guard let buffer = malloc(Int(maxBound)) else {
-                throw ZStdOutOfMemoryError(requiredSize: Int(maxBound))
-            }
-            let decompressedSize = ZSTD_decompress(buffer, Int(maxBound), rawPointer.baseAddress, data.count)
-            if ZSTD_isError(decompressedSize) != 0 {
-                free(buffer)
-                throw ZStdUnderlyingError(code: decompressedSize,
-                                          error: String(utf8String: ZSTD_getErrorName(decompressedSize)) ?? "")
-            }
-            
-            return Data(bytesNoCopy: buffer, count: decompressedSize, deallocator: .free)
+        let src = InputStream(data: data)
+        let dst = OutputStream(toMemory: ())
+        try decompress(src: src, dst: dst)
+        guard let content = dst.property(forKey: .dataWrittenToMemoryStreamKey) as? NSData else {
+            throw ZStdWritingFromStreamSignalledError()
         }
+        return content as Data
     }
 
     private static func checkErrorCode(code: Int) throws {
