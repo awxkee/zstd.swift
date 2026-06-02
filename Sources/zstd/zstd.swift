@@ -235,8 +235,6 @@ public struct ZStd {
         return Data(bytesNoCopy: finalBuffer, count: compressedSize, deallocator: .free)
     }
 
-    /// Decompresses a Data blob, correctly handling single-frame and multi-frame zstd files.
-    /// Delegates to the stream implementation which handles frame boundaries properly.
     public static func decompress(_ data: Data) throws -> Data {
         let src = InputStream(data: data)
         let dst = OutputStream(toMemory: ())
